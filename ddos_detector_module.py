@@ -24,6 +24,9 @@ What changed
 
 from collections import defaultdict
 from typing import Optional
+import time
+
+_last_ddos_alert: dict = {} # ip -> timestamp
 
 # ── Original thresholds kept as fallback (DO NOT REMOVE) ─────────────────────
 THRESHOLD  = 150   # packets per second – original fixed threshold
@@ -123,29 +126,48 @@ def detect_ddos_from_flows(
             f"  ADAPTIVE_THR={adaptive_thr:.1f}"
         )
 
-        # ── Decision ──────────────────────────────────────────────────────
-        # Require at least MIN_ALERTS windows above the adaptive threshold
-        min_alerts_needed = max(2, MIN_ALERTS)  # adaptive lower bound
-
-        if adaptive_alerts >= min_alerts_needed and max_pps > adaptive_thr:
-            # Apply context check to suppress false positives
-            if _ctx_layer:
-                should_flag, reason = _ctx_layer.should_flag_ddos(
-                    ip, max_pps, adaptive_alerts
-                )
-                if should_flag:
-                    print(f"[DDoS] ⚠  DDoS pattern detected from {ip}  ({reason})")
-                    results[ip] = "ATTACK"
-                else:
-                    print(
-                        f"[DDoS] ↳  Suppressed for {ip}: {reason}"
-                    )
-                    results[ip] = "NORMAL"
-            else:
-                # No context layer → fall back to original behaviour
-                print(f"[DDoS] ⚠  DDoS pattern detected from {ip}")
-                results[ip] = "ATTACK"
-        else:
+        total_flows = len(values)
+        
+        # ── 1. Minimum Alert Threshold ────────────────────────────────────
+        if adaptive_alerts < 3:
             results[ip] = "NORMAL"
+            continue
+
+        # ── 2. Confidence-Based Filtering ─────────────────────────────────
+        ddos_confidence = adaptive_alerts / total_flows if total_flows > 0 else 0.0
+        
+        if ddos_confidence < 0.3:
+            print(f"[DDoS] ↳  Suppressed: {ip} | conf {ddos_confidence:.2f} < 0.3")
+            results[ip] = "NORMAL"
+            continue
+
+        # Apply context check to suppress false positives
+        if _ctx_layer:
+            should_flag, reason = _ctx_layer.should_flag_ddos(
+                ip, max_pps, adaptive_alerts
+            )
+            if not should_flag:
+                print(f"[DDoS] ↳  Suppressed: {ip} | {reason}")
+                results[ip] = "NORMAL"
+                continue
+
+        # ── 3. Cooldown System (10s) ──────────────────────────────────────
+        now = time.time()
+        if now - _last_ddos_alert.get(ip, 0) < 10.0:
+            print(f"[DDoS] ↳  Suppressed: {ip} | Cooldown active (10s)")
+            results[ip] = "NORMAL"  # Or keep previous state, but we return NORMAL so we don't trigger action engine
+            continue
+            
+        _last_ddos_alert[ip] = now
+
+        # ── 4. Alert vs Attack Separation ─────────────────────────────────
+        # Weak signals -> MONITOR (SUSPICIOUS)
+        # Strong/sustained signals -> BLOCK (ATTACK)
+        if ddos_confidence >= 0.7 or adaptive_alerts >= 6:
+            print(f"[DDoS] ⚠  ATTACK: {ip} | conf={ddos_confidence:.2f} alerts={adaptive_alerts}")
+            results[ip] = "ATTACK"
+        else:
+            print(f"[DDoS] ⚠  ALERT: {ip} | conf={ddos_confidence:.2f} alerts={adaptive_alerts}")
+            results[ip] = "SUSPICIOUS"
 
     return results

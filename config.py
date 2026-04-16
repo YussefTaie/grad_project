@@ -6,10 +6,11 @@ config.py — مصدر حقيقة واحد لكل ثوابت النظام
 
 # ==============================
 # 🎯 عتبات القرار (XGBoost)
+# TUNED: raised thresholds to reduce false positives
 # ==============================
-THRESHOLD_HIGH_ATTACK    = 0.75   # فوقيها → ATTACK مؤكد
-THRESHOLD_MEDIUM_ATTACK  = 0.50   # فوقيها + ISO → ATTACK
-THRESHOLD_SUSPICIOUS     = 0.30   # فوقيها → SUSPICIOUS
+THRESHOLD_HIGH_ATTACK    = 0.85   # was 0.75 → now requires higher confidence for ATTACK
+THRESHOLD_MEDIUM_ATTACK  = 0.70   # was 0.50 → prevent low-conf ML from triggering attacks
+THRESHOLD_SUSPICIOUS     = 0.50   # was 0.30 → iso alone is no longer enough
 
 # ==============================
 # 🌲 Isolation Forest
@@ -35,6 +36,49 @@ DNS_QUERY_THRESHOLD      = 50     # استعلام DNS / دقيقة من IP وا
 PORT_DIVERSITY_THRESHOLD = 30     # عدد IPs وجهة مختلفة / دقيقة → مشبوه
 C2_BEACON_STD_THRESHOLD  = 0.5   # انحراف معياري منخفض لفترات الاتصال → C2 beacon
 C2_MIN_CONNECTIONS       = 5     # حد أدنى للاتصالات قبل تقييم النمط الدوري
+
+# ==============================
+# 🛑 Debouncer (Anti-False-Positive)
+# An IP is only actioned after N suspicious events within WINDOW seconds.
+# ==============================
+DEBOUNCE_MIN_EVENTS  = 3     # minimum suspicious events before firing
+DEBOUNCE_WINDOW_SEC  = 10.0  # sliding window in seconds
+
+# ==============================
+# 🦠 Malware Detector Tuning
+# ==============================
+# Diversity: if IP talks to many different targets → likely benign browsing
+MALWARE_DIVERSITY_THRESHOLD        = 5     # unique dst IPs above this → apply diversity reduction
+MALWARE_DIVERSITY_SCORE_FACTOR     = 0.3   # multiply malware score by this if high diversity
+MALWARE_REPETITION_RATIO_THRESHOLD = 0.3   # below this repetition → reduce score
+
+# Session: long sessions with high bytes are likely streaming, not malware
+MALWARE_SESSION_DURATION_SEC       = 10.0  # seconds
+MALWARE_SESSION_BYTES_THRESHOLD    = 100_000  # bytes
+MALWARE_SESSION_SCORE_FACTOR       = 0.2   # multiply score if looks like streaming
+
+# ML override: if ML says BENIGN with high confidence, suppress malware alert
+MALWARE_ML_BENIGN_CONF_THRESHOLD   = 0.95  # ML confidence above this → reduce score
+MALWARE_ML_OVERRIDE_FACTOR         = 0.2   # multiply malware score by this
+
+# Beaconing: how many repeated (src→dst) flows to trigger
+MALWARE_BEACON_MIN_FLOWS    = 8    # was 5  → needs more evidence
+MALWARE_BEACON_ATTACK_FLOWS = 15   # was 10 → even higher bar for ATTACK
+MALWARE_ASYM_RATIO          = 30   # was 20 → one-sided flows need to be more extreme
+MALWARE_ASYM_MIN_FWD        = 100  # was 50 → need more packets before flagging asymmetry
+
+# Exfiltration: raised bar to avoid triggering on legitimate downloads
+MALWARE_EXFIL_SUSPICIOUS_BYTES = 2_000_000    # was 500KB → now 2MB
+MALWARE_EXFIL_ATTACK_BYTES     = 10_000_000   # was 2MB  → now 10MB
+
+# ==============================
+# 🔴 Ransomware Detection Heuristics
+# ==============================
+RANSOMWARE_CONN_PER_SEC_THRESHOLD = 5.0   # connections/s above this is suspicious
+RANSOMWARE_SMALL_PKT_SIZE_MAX     = 300   # bytes — "small" packet definition
+RANSOMWARE_SMALL_PKT_RATIO_MIN    = 0.7   # 70%+ small packets → indicator
+RANSOMWARE_MIN_FLOWS_FOR_EVAL     = 10    # need at least this many flows to evaluate
+RANSOMWARE_SCORE_INCREMENT        = 0.6   # score added per ransomware indicator hit
 
 # ==============================
 # 🗺️ خريطة تصنيف الهجمات (متعدد الفئات)

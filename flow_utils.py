@@ -33,11 +33,13 @@ def compute_pps(packet_count: int, duration_sec: float) -> float:
 
     Examples:
         >>> compute_pps(1, 0.0)      # single-packet flow
-        100.0                         # not 1,000,000,000
+        1.0                           # pps = 1 / max(0, 1) = 1.0
         >>> compute_pps(100, 1.0)    # 100 pkts over 1 second
         100.0
         >>> compute_pps(500, 5.0)    # 100 pps, 5 second flow
         100.0
     """
-    safe_duration = max(duration_sec, MIN_FLOW_DURATION_SEC)
+    # Use packets / max(duration, 1) as specified — avoids PPS=0 for short flows
+    # while preventing artificial inflation from sub-millisecond durations.
+    safe_duration = max(duration_sec, 1.0)
     return packet_count / safe_duration

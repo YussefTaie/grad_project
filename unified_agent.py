@@ -47,6 +47,7 @@ log = logging.getLogger("UnifiedAgent")
 
 # ── Local modules ─────────────────────────────────────────────
 from action             import take_action
+from action_manager     import execute_action          # Threat-specific IPS dispatcher
 from config             import (
     FLOW_TIMEOUT_SEC, MAX_FLOW_PACKETS, API_URL,
 )
@@ -78,19 +79,19 @@ def fusion(
     ctx_result=None,           # optional ContextResult from context_layer
 ) -> tuple[str, str]:
     """
-    Hybrid multi-signal fusion engine.
+    Hybrid multi-signal fusion engine  (TUNED — thresholds raised for FP reduction).
 
     Rules (priority order)
     ----------------------
     ATTACK     → strong rule trigger (DDoS / BruteForce / Malware)
-                 OR ML ATTACK with high confidence (>0.85)
-                 OR ML ATTACK with conf>0.65 AND iso_flag
+                 OR ML ATTACK with conf > 0.85  (was 0.85, unchanged)
+                 OR ML ATTACK with conf > 0.70 AND iso_flag  (was 0.65)
 
-    SUSPICIOUS → anomaly + rule corroboration
-                 OR ML SUSPICIOUS + Malware(Suspicious)
+    SUSPICIOUS → ML ATTACK with moderate conf (0.50–0.70)
+                 OR ML SUSPICIOUS with corroboration
                  OR context-layer multi-signal
 
-    NORMAL     → no strong signals  (iso alone is NOT sufficient)
+    NORMAL     → no strong signals  (iso alone or low-conf ML is NOT sufficient)
     """
     ml_label  = ml_result.get("result",      "NORMAL").upper()
     ml_type   = ml_result.get("attack_type", "")
@@ -102,23 +103,24 @@ def fusion(
     if brute   == "ATTACK": return "ATTACK", "BruteForce"
     if malware == "ATTACK": return "ATTACK", "Malware"
 
-    # ── 2. ML ATTACK verdict ──────────────────────────────────
+    # ── 2. ML ATTACK verdict — TUNED thresholds ───────────────
     if "ATTACK" in ml_label:
         if ml_conf > 0.85:
-            return "ATTACK", f"ML:{ml_type}(conf={ml_conf:.2f})"
-        if ml_conf > 0.65 and iso_flag == 1:
-            return "ATTACK", f"ML+ISO:{ml_type}(conf={ml_conf:.2f})"
-        if ml_conf > 0.50:
+            return "ATTACK",    f"ML:{ml_type}(conf={ml_conf:.2f})"
+        if ml_conf > 0.70 and iso_flag == 1:   # was 0.65
+            return "ATTACK",    f"ML+ISO:{ml_type}(conf={ml_conf:.2f})"
+        if ml_conf > 0.50:                      # was 0.50 — unchanged, but now feeds SUSPICIOUS only
             return "SUSPICIOUS", f"ML:{ml_type}(conf={ml_conf:.2f},moderate)"
-        return "SUSPICIOUS", f"ML:{ml_type}(low_conf={ml_conf:.2f})"
+        # Low confidence ML ATTACK alone → normal; do not escalate
+        return "NORMAL", f"ML_LOW_CONF:{ml_type}(conf={ml_conf:.2f})"
 
     # ── 3. ML SUSPICIOUS — require corroboration ──────────────
     if "SUSPICIOUS" in ml_label:
         if malware == "SUSPICIOUS":
             return "SUSPICIOUS", f"ML+Malware(Suspicious):{ml_type}"
-        if iso_flag == 1 and ml_conf > 0.30:
-            return "SUSPICIOUS", f"ML(ISO+lowconf):{ml_type}"
-        # iso alone → suppress false positive
+        if iso_flag == 1 and ml_conf > 0.50:    # was 0.30 → raised
+            return "SUSPICIOUS", f"ML(ISO+moderate_conf):{ml_type}"
+        # iso alone or very low conf → suppress
         return "NORMAL", "BENIGN"
 
     # ── 4. Context-layer escalation (adaptive module only) ────
@@ -158,25 +160,31 @@ def call_ml_api(features: dict) -> dict:
 # SECTION 3 — AGGREGATE ANALYSIS  (shared)
 # ══════════════════════════════════════════════════════════════
 
-def run_aggregate(flows: list[dict], label: str = ""):
+def run_aggregate(
+    flows: list[dict],
+    label: str = "",
+    ml_results: dict | None = None,   # { src_ip → ml prediction dict }
+):
     """
     Runs DDoS + BruteForce + Malware on a batch of flows and takes
     action on any suspicious IPs.
-    Context-layer evaluation is injected here for aggregate-level FP reduction.
+
+    ml_results: if provided, passed into malware_verdict_by_ip so that
+    the ML override can suppress benign-but-noisy flows.
     """
     if not flows:
         return
 
     log.info(f"[Aggregate{' '+label if label else ''}] Analyzing {len(flows)} flows...")
 
-    # FIX 2: DO NOT feed the baseline engine here.
+    # NOTE: DO NOT feed the baseline engine here.
     # Each flow is already observed ONCE in process_flow_ml().
-    # Calling _ctx.observe() again here caused double-counting, corrupting
-    # the baseline mean/std and producing false-positive high-PPS alarms.
+    # Double-calling _ctx.observe() corrupts the baseline mean/std.
 
     ddos_v    = detect_ddos_from_flows(flows)
     brute_v   = bruteforce_verdict_by_ip(flows)
-    malware_v = malware_verdict_by_ip(flows)
+    # Pass ml_results so malware detector can apply ML override
+    malware_v = malware_verdict_by_ip(flows, ml_results=ml_results)
 
     all_ips = {
         (f.get("Src IP") or f.get("Source IP") or f.get("src_ip", "unknown"))
@@ -189,10 +197,9 @@ def run_aggregate(flows: list[dict], label: str = ""):
         b = brute_v.get(ip,   "NORMAL")
         m = malware_v.get(ip, "NORMAL")
 
-        # Pull context result for this IP if adaptive module is available
+        # Context result from adaptive module
         ctx_result = None
         if _ADAPTIVE:
-            # Build a representative flow for this IP to get context
             ip_flows = [
                 f for f in flows
                 if (f.get("Src IP") or f.get("Source IP") or
@@ -201,7 +208,32 @@ def run_aggregate(flows: list[dict], label: str = ""):
             if ip_flows:
                 ctx_result = _ctx.evaluate(ip_flows[-1])
 
-        verdict, reason = fusion(d, b, m, {"result": "NORMAL"}, ctx_result)
+        # Collect per-IP stats for structured log
+        ip_flows_all = [
+            f for f in flows
+            if (f.get("Src IP") or f.get("Source IP") or f.get("src_ip")) == ip
+        ]
+        ml_r   = (ml_results or {}).get(ip, {})
+        ml_conf = float(ml_r.get("confidence", 0.0))
+        ml_lbl  = ml_r.get("result", "N/A")
+        total_pkt = sum(int(f.get("Total Packets", 0)) for f in ip_flows_all)
+        total_byt = sum(_get_bytes(f) for f in ip_flows_all)
+        avg_pps   = (
+            sum(float(f.get("Packets per Second", 0)) for f in ip_flows_all)
+            / max(len(ip_flows_all), 1)
+        )
+
+        verdict, reason = fusion(d, b, m, ml_r, ctx_result)
+
+        # ── Structured decision log (MANDATORY) ───────────────
+        log.info(
+            f"[Decision] src_ip={ip} "
+            f"packets={total_pkt} bytes={total_byt} pps={avg_pps:.1f} "
+            f"ddos={d} brute={b} malware={m} "
+            f"ml_label={ml_lbl} ml_conf={ml_conf:.3f} "
+            f"verdict={verdict} reason={reason}"
+        )
+
         if verdict in ("ATTACK", "SUSPICIOUS"):
             flags = []
             if d == "ATTACK": flags.append("DDoS")
@@ -211,11 +243,39 @@ def run_aggregate(flows: list[dict], label: str = ""):
 
             icon = "[!!]" if verdict == "ATTACK" else "[? ]"
             print(f"  {icon} [{verdict:<10}] src={ip:<16} detectors={flags_str}")
-            take_action(verdict, ip, attack_type=flags_str)
+
+            # Rule-based triggers get conf=1.0, ML-only gets ml_conf
+            rule_triggered = any(x in flags_str for x in ["DDoS", "BruteForce", "Malware"])
+            action_conf = 1.0 if rule_triggered else max(ml_conf, 0.0)
+
+            # Route to threat-specific action handler (Action Manager)
+            if "DDoS" in flags_str:
+                execute_action(ip, "DDOS",       verdict, reason=flags_str, conf=action_conf)
+            elif "BruteForce" in flags_str:
+                execute_action(ip, "BRUTEFORCE", verdict, reason=flags_str, conf=action_conf)
+            elif "Malware" in flags_str:
+                threat = "RANSOMWARE" if "ansomware" in flags_str else "MALWARE"
+                execute_action(ip, threat,       verdict, reason=flags_str, conf=action_conf)
+            else:
+                execute_action(ip, "GENERIC",    verdict, reason=flags_str, conf=action_conf)
+
             acted.append(ip)
 
     if not acted:
         log.info("  [OK] No aggregate threats found.")
+
+
+def _get_bytes(flow: dict) -> int:
+    """Extract total bytes from a flow dict, trying multiple key names."""
+    for k in ("Total Bytes", "Total Length of Fwd Packets",
+              "Subflow Fwd Bytes", "total_bytes"):
+        v = flow.get(k)
+        if v is not None:
+            try:
+                return int(float(v))
+            except (ValueError, TypeError):
+                pass
+    return 0
 
 
 # ══════════════════════════════════════════════════════════════
@@ -299,8 +359,13 @@ def compute_features(flow_data: dict) -> dict | None:
 
 
 def process_flow_ml(features: dict, src_ip: str):
-    """Send flow to the ML API, apply context-aware post-filter, take action."""
-    # Feed the baseline engine continuously
+    """Send flow to ML API, apply context-aware filter, structured-log, take action."""
+    # ── MICRO FLOW HANDLING: Tag, don't drop (preserves scan/probe detection) ──
+    dur = float(features.get("Flow Duration", 0.0)) / 1_000_000
+    pkts = int(features.get("Total Packets", 0))
+    is_micro = dur < 0.5 or pkts < 3
+
+    # Feed the baseline engine (all flows, including micro)
     if _ADAPTIVE:
         _ctx.observe(features)
 
@@ -308,17 +373,23 @@ def process_flow_ml(features: dict, src_ip: str):
     if "ERROR" in ml.get("result", "").upper():
         return ml
 
-    label      = ml.get("result", "NORMAL")
-    atype      = ml.get("attack_type", "")
-    conf       = ml.get("confidence", 0.0)
-    iso_flag   = ml.get("iso_flag", 0)
+    label    = ml.get("result",      "NORMAL")
+    atype    = ml.get("attack_type", "")
+    conf     = float(ml.get("confidence", 0.0))
+    iso_flag = int(ml.get("iso_flag",     0))
+    ae_flag  = int(ml.get("ae_flag",      0))
+
+    pps = float(features.get("Packets per Second", 0.0))
+    dur = float(features.get("Flow Duration", 0.0)) / 1_000_000   # µs → s
+    pkts = int(features.get("Total Packets", 0))
+    byts = _get_bytes(features)
 
     # Context evaluation for per-flow FP suppression
     ctx_result = None
     if _ADAPTIVE:
-        ctx_result = _ctx.evaluate(features, raw_pps=features.get("Packets per Second", 0))
+        ctx_result = _ctx.evaluate(features, raw_pps=pps)
 
-    # Upgrade/downgrade verdict via hybrid fusion
+    # Hybrid fusion (rule verdicts all NORMAL here — per-flow ML only)
     fused_verdict, fused_reason = fusion(
         "NORMAL", "NORMAL", "NORMAL", ml, ctx_result
     )
@@ -327,13 +398,26 @@ def process_flow_ml(features: dict, src_ip: str):
         "[!!]" if fused_verdict == "ATTACK" else
         "[? ]" if fused_verdict == "SUSPICIOUS" else "[OK]"
     )
-    print(
-        f"  {icon} ML  src={src_ip:<15}  type={atype:<22}  "
-        f"conf={conf:.3f}  iso={iso_flag}  fused={fused_verdict}"
-    )
 
-    if fused_verdict == "ATTACK" and conf > 0.65:
-        take_action(fused_verdict, src_ip, attack_type=atype)
+    # ── Micro flow: cap confidence, log at DEBUG (visible but not noisy) ───
+    if is_micro:
+        conf = min(conf, 0.4)   # Hard cap: micro flows cannot trigger a block
+        log.debug(
+            f"[micro] src={src_ip:<15} type={atype:<22} "
+            f"dur={dur:.3f}s pkts={pkts} conf_capped={conf:.3f}"
+        )
+    else:
+        # ── Structured per-flow log ────────────────────────────────────────
+        log.info(
+            f"{icon} src={src_ip:<15} type={atype:<22} "
+            f"conf={conf:.3f} iso={iso_flag} ae={ae_flag} "
+            f"pps={pps:.1f} dur={dur:.2f}s pkts={pkts} bytes={byts} "
+            f"fused={fused_verdict} reason={fused_reason}"
+        )
+
+    # Only act if conf > 0.85 AND not a micro flow
+    if fused_verdict == "ATTACK" and conf > 0.85 and not is_micro:
+        take_action(fused_verdict, src_ip, attack_type=atype, conf=conf)
     return ml
 
 
@@ -574,54 +658,78 @@ def _run_csv(path: str, watch: bool = False):
 
 def _run_analysis_on_flows(flows: list[dict], label: str = ""):
     """
-    Pipeline كامل على قائمة flows:
-      - ML per flow (via API)
-      - Aggregate (DDoS + BruteForce + Malware)
-      - Summary
+    Complete pipeline on a list of flows:
+      1. ML per-flow  (via API)         — collects ml_results by src_ip
+      2. Aggregate (DDoS + BruteForce + Malware) — passes ml_results for ML override
+      3. Summary
     """
     if not flows:
         log.warning("No flows to analyze.")
         return
 
-    summary = {"ATTACK": 0, "SUSPICIOUS": 0, "NORMAL": 0, "ERROR": 0}
+    # ── MICRO FLOW HANDLING: Include in aggregate but tag as low confidence ──
+    for f in flows:
+        dur = float(f.get("Flow Duration", 0.0)) / 1_000_000
+        pkts = int(f.get("Total Packets", 0))
+        if dur < 0.5 or pkts < 3:
+            # Tag as micro: won't trigger blocking, but still feeds DDoS/BruteForce/Malware aggregates
+            f["_is_micro"] = True
+
+    if not flows:
+        log.info(f"[{label}] No flows to analyze.")
+        return
+
+    summary    = {"ATTACK": 0, "SUSPICIOUS": 0, "NORMAL": 0, "ERROR": 0}
+    ml_results: dict = {}   # { src_ip → latest ml prediction dict }
     log.info(f"[{label}] Starting per-flow ML analysis ({len(flows)} flows)...\n")
 
     for flow in flows:
-        src = (flow.get("Src IP") or flow.get("Source IP") or
-               flow.get("src_ip", "unknown"))
+        src = (
+            flow.get("Src IP") or flow.get("Source IP") or
+            flow.get("src_ip", "unknown")
+        )
         ml = call_ml_api(flow)
 
         if "ERROR" in ml.get("result", "").upper():
             summary["ERROR"] += 1
             continue
 
+        # Store latest ML result per IP (used by malware ML-override)
+        ml_results[src] = ml
+
         label_ml = ml.get("result", "NORMAL")
         atype    = ml.get("attack_type", "")
-        conf     = ml.get("confidence", 0.0)
-        icon     = "[!!]" if "ATTACK" in label_ml.upper() else "[? ]" if "SUSPICIOUS" in label_ml.upper() else "[OK]"
+        conf     = float(ml.get("confidence", 0.0))
+        icon     = (
+            "[!!]" if "ATTACK"    in label_ml.upper() else
+            "[? ]" if "SUSPICIOUS" in label_ml.upper() else "[OK]"
+        )
 
-        print(f"  {icon} [{label_ml:<10}] src={src:<15}  type={atype:<22}  conf={conf:.3f}")
-        summary[label_ml.upper().replace("ATTACK", "ATTACK").replace("SUSPICIOUS", "SUSPICIOUS").replace("NORMAL", "NORMAL")] = \
-            summary.get(label_ml.upper(), 0) + 1
+        log.info(
+            f"{icon} [{label_ml:<10}] src={src:<15} "
+            f"type={atype:<22} conf={conf:.3f}"
+        )
+        bucket = label_ml.upper() if label_ml.upper() in summary else "NORMAL"
+        summary[bucket] = summary.get(bucket, 0) + 1
 
         if "ATTACK" in label_ml.upper() and conf > 0.85:
-            take_action(label_ml, src, attack_type=atype)
+            take_action(label_ml, src, attack_type=atype, conf=conf)
 
-    # Aggregate
+    # Aggregate — now with ml_results so malware detector can apply ML override
     print(f"\n{'='*60}")
     print(f"  [~] Aggregate Analysis ({len(flows)} flows)")
     print(f"{'='*60}")
-    run_aggregate(flows, label=label)
+    run_aggregate(flows, label=label, ml_results=ml_results)
 
-    # Summary
+    # Final summary
     total = sum(summary.values())
     print(f"\n{'='*60}")
     print(f"  FINAL SUMMARY  ({total} flows processed)")
     print(f"{'='*60}")
-    print(f"  [!!] ATTACK    : {summary.get('ATTACK', 0)}")
+    print(f"  [!!] ATTACK    : {summary.get('ATTACK',    0)}")
     print(f"  [? ] SUSPICIOUS: {summary.get('SUSPICIOUS', 0)}")
-    print(f"  [OK] NORMAL    : {summary.get('NORMAL', 0)}")
-    print(f"  [XX] ERRORS    : {summary.get('ERROR', 0)}")
+    print(f"  [OK] NORMAL    : {summary.get('NORMAL',    0)}")
+    print(f"  [XX] ERRORS    : {summary.get('ERROR',     0)}")
     print(f"{'='*60}")
 
 
