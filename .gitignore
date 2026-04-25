@@ -1,4 +1,5 @@
- 
-dataset/ 
-__pycache__/ 
+node_modules/
+__pycache__/
 .env
+dataset/
+*.pkl
