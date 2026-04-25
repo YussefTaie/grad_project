@@ -48,14 +48,28 @@ log = logging.getLogger("UnifiedAgent")
 # ── Local modules ─────────────────────────────────────────────
 from action             import take_action
 from action_manager     import execute_action          # Threat-specific IPS dispatcher
+from auto_response_engine import auto_response_engine
 from config             import (
-    FLOW_TIMEOUT_SEC, MAX_FLOW_PACKETS, API_URL,
+    AUTO_RESPONSE_ENABLED, FLOW_TIMEOUT_SEC, MAX_FLOW_PACKETS, API_URL,
 )
+from host_actions       import execute_host_action, get_action_state
 from ddos_detector_module  import detect_ddos_from_flows
 from brute_force_detector  import bruteforce_verdict_by_ip
 from malware_detector      import malware_verdict_by_ip
 # FIX 1 + FIX 5 — shared, consistent PPS calculation
 from flow_utils            import compute_pps
+from state_manager         import agent_state
+from dashboard_api         import run_api_server
+
+from db import (
+    sync_init_pool,
+    sync_db_ping,
+    sync_insert_alert,
+    sync_insert_detection,
+    sync_insert_flow,
+    sync_upsert_host,
+    sync_insert_action
+)
 
 # ── Adaptive intelligence (new, non-breaking) ────────────────────
 try:
@@ -234,6 +248,9 @@ def run_aggregate(
             f"verdict={verdict} reason={reason}"
         )
 
+        # ── Update in-memory state manager ───────────────
+        agent_state.update_decision(ip, total_pkt, total_byt, avg_pps, verdict, reason)
+
         if verdict in ("ATTACK", "SUSPICIOUS"):
             flags = []
             if d == "ATTACK": flags.append("DDoS")
@@ -248,16 +265,72 @@ def run_aggregate(
             rule_triggered = any(x in flags_str for x in ["DDoS", "BruteForce", "Malware"])
             action_conf = 1.0 if rule_triggered else max(ml_conf, 0.0)
 
+            # DB Insertion
+            try:
+                sync_insert_detection(
+                    src_ip=ip,
+                    result=verdict,
+                    attack_type=reason,
+                    confidence=action_conf,
+                    iso_flag=0
+                )
+                sync_insert_alert(
+                    ip,
+                    reason,
+                    f"{reason} detected from {ip}"
+                )
+                sync_upsert_host(ip, "COMPROMISED")
+                print(f"[DB] Alert stored: {ip} - {reason}")
+            except Exception as e:
+                log.warning(f"[DB] Detection storage failed: {e}")
+
+            # ── [WS] Broadcast alert to all connected dashboard clients ──
+            agent_state.broadcast_alert(ip, reason, f"{reason} detected from {ip}")
+
+            # ── [AUTO DEFENSE] Decide and execute automatic response ─────
+            action_state = get_action_state(ip)
+            auto_history = auto_response_engine.record_event(
+                {
+                    "ip": ip,
+                    "confidence": action_conf,
+                    "attack_type": reason,
+                    "pps": avg_pps,
+                }
+            )
+            auto_decision = auto_response_engine.evaluate(
+                {
+                    "ip": ip,
+                    "confidence": action_conf,
+                    "attack_type": reason,
+                    "pps": avg_pps,
+                    "history": auto_history,
+                }
+            )
+            if AUTO_RESPONSE_ENABLED and not action_state.get("is_whitelisted") and auto_decision.action:
+                payload, _ = execute_host_action(
+                    action=auto_decision.action,
+                    target=ip,
+                    reason=auto_decision.reason,
+                    source="auto",
+                    confidence=action_conf,
+                    trigger="auto",
+                )
+                if payload.get("status") == "success":
+                    print(f"[AUTO RESPONSE] {auto_decision.action} triggered for {ip} (conf={action_conf:.2f})")
+                    auto_response_engine.mark_action(ip)
+                    agent_state.broadcast_action(ip, auto_decision.action.upper(), reason=auto_decision.reason)
+
             # Route to threat-specific action handler (Action Manager)
-            if "DDoS" in flags_str:
-                execute_action(ip, "DDOS",       verdict, reason=flags_str, conf=action_conf)
-            elif "BruteForce" in flags_str:
-                execute_action(ip, "BRUTEFORCE", verdict, reason=flags_str, conf=action_conf)
-            elif "Malware" in flags_str:
-                threat = "RANSOMWARE" if "ansomware" in flags_str else "MALWARE"
-                execute_action(ip, threat,       verdict, reason=flags_str, conf=action_conf)
-            else:
-                execute_action(ip, "GENERIC",    verdict, reason=flags_str, conf=action_conf)
+            if not AUTO_RESPONSE_ENABLED:
+                if "DDoS" in flags_str:
+                    execute_action(ip, "DDOS",       verdict, reason=flags_str, conf=action_conf)
+                elif "BruteForce" in flags_str:
+                    execute_action(ip, "BRUTEFORCE", verdict, reason=flags_str, conf=action_conf)
+                elif "Malware" in flags_str:
+                    threat = "RANSOMWARE" if "ansomware" in flags_str else "MALWARE"
+                    execute_action(ip, threat,       verdict, reason=flags_str, conf=action_conf)
+                else:
+                    execute_action(ip, "GENERIC",    verdict, reason=flags_str, conf=action_conf)
 
             acted.append(ip)
 
@@ -418,6 +491,13 @@ def process_flow_ml(features: dict, src_ip: str):
     # Only act if conf > 0.85 AND not a micro flow
     if fused_verdict == "ATTACK" and conf > 0.85 and not is_micro:
         take_action(fused_verdict, src_ip, attack_type=atype, conf=conf)
+        
+    try:
+        dst_ip = features.get("Dst IP") or features.get("Destination IP") or features.get("dst_ip", "unknown")
+        sync_insert_flow(src_ip, dst_ip, pkts, byts, pps, dur)
+    except Exception as e:
+        log.warning(f"[DB] Flow logging failed: {e}")
+        
     return ml
 
 
@@ -765,6 +845,14 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # CRITICAL: Initialize DB connection pool before any operations
+    try:
+        sync_init_pool()
+        sync_db_ping()
+        print("  [*] DB Connection Pool initialized.")
+    except Exception as e:
+        print(f"  [!] DB Pool init failed: {e}")
+
     print("\n" + "=" * 60)
     print("  [*] UNIFIED IDS AGENT")
     print(f"  Mode  : {args.mode.upper()}")
@@ -780,6 +868,12 @@ def main():
     print("    [2] DDoS — PPS rule-based        (aggregate)")
     print("    [3] BruteForce — attempts rule   (aggregate)")
     print("    [4] Malware — behavioral rules   (aggregate)")
+    print()
+
+    # Start dashboard API in the background
+    api_thread = threading.Thread(target=run_api_server, daemon=True)
+    api_thread.start()
+    print("  [*] Started Dashboard API/WS on port 8001")
     print()
 
     if args.mode == "live":

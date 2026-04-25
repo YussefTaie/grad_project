@@ -26,6 +26,16 @@ from action import (
     ip_in_whitelist, _states, IPState
 )
 
+# ── [DB] Import sync wrappers (async db.py, bridged for threaded callers) ────
+from db import (
+    sync_insert_action       as insert_action,
+    sync_insert_blocked_ip   as insert_blocked_ip,
+    sync_remove_blocked_ip   as remove_blocked_ip,
+    sync_upsert_host         as upsert_host,
+    sync_update_host_status  as update_host_status,
+    sync_insert_alert        as insert_alert,
+)
+
 log = logging.getLogger("ActionManager")
 
 # ──────────────────────────────────────────────────────────────
@@ -59,23 +69,63 @@ def get_all_incidents() -> list[dict]:
                 "ip": h.ip, "status": h.status, "threat": h.threat_type,
                 "incidents": h.incident_count,
                 "first_seen": h.first_seen, "last_seen": h.last_seen,
-                "notes": h.notes[-5:],  # Last 5 notes
+                "notes": h.notes[-5:],
             }
             for h in _host_registry.values()
             if h.status != "CLEAN"
         ]
+
+
+# ──────────────────────────────────────────────────────────────
+# [DB] Non-blocking DB helper — wraps all DB calls in daemon thread
+# ──────────────────────────────────────────────────────────────
+
+def _db_action(ip: str, action_type: str, reason: str, block: bool = False, new_status: str = ""):
+    """
+    Fire-and-forget DB writes for an IPS action.
+    Runs in a daemon thread so the caller is never blocked.
+
+    Args:
+        ip:          The IP acted on
+        action_type: BLOCK | MONITOR | ISOLATE | UNBLOCK
+        reason:      Human-readable reason
+        block:       If True, also insert into blocked_ips
+        new_status:  If set, update hosts.status to this value
+
+    Alert mapping (60s cooldown dedup handled inside insert_alert):
+        BLOCK   → alert_type=BLOCK        "IP blocked due to attack"
+        MONITOR → alert_type=SUSPICIOUS   "Suspicious activity detected"
+        ISOLATE → alert_type=MALWARE      "Host isolated due to malware behavior"
+    """
+    def _write():
+        try:
+            upsert_host(ip)
+            insert_action(ip, action_type, reason)
+            if block:
+                insert_blocked_ip(ip, reason)
+            if new_status:
+                update_host_status(ip, new_status)
+
+            # ── [ALERT] Insert alert based on action type ────────────
+            atype = action_type.upper()
+            if atype in ("BLOCK",):
+                insert_alert(ip, "BLOCK",      f"IP {ip} blocked due to attack: {reason[:200]}")
+            elif atype == "MONITOR":
+                insert_alert(ip, "SUSPICIOUS", f"Suspicious activity from {ip}: {reason[:200]}")
+            elif atype == "ISOLATE":
+                insert_alert(ip, "MALWARE",    f"Host {ip} isolated due to malware behavior: {reason[:200]}")
+            # ───────────────────────────────────────────────────────
+
+        except Exception as e:
+            log.error(f"[DB ERROR] _db_action failed for {ip}: {e}")
+
+    threading.Thread(target=_write, daemon=True).start()
 
 # ──────────────────────────────────────────────────────────────
 # 🔴 Threat-Specific Response Handlers
 # ──────────────────────────────────────────────────────────────
 
 def _handle_malware(ip: str, reason: str, conf: float):
-    """
-    Malware Response:
-    - Block source IP (firewall)
-    - Mark host as COMPROMISED
-    - Log detailed structured incident
-    """
     host = _get_or_create(ip)
     host.threat_type = "MALWARE"
     host.incident_count += 1
@@ -86,21 +136,15 @@ def _handle_malware(ip: str, reason: str, conf: float):
         f"reason={reason} | incident_count={host.incident_count}"
     )
 
-    # Execute block through progressive engine
     execute_decision(ip, "BLOCK", reason=f"MALWARE:{reason}", conf=conf)
-
-    # Mark status after action engine processes it
     host.status = "COMPROMISED"
     log.warning(f"[HOST STATUS] {ip} marked as COMPROMISED")
 
+    # [DB] persist block + status change
+    _db_action(ip, "BLOCK", reason, block=True, new_status="COMPROMISED")
+
 
 def _handle_ransomware(ip: str, reason: str, conf: float, simulation: bool = False):
-    """
-    Ransomware Response (Critical):
-    - Full isolation (block inbound + outbound simulation)
-    - Mark as CRITICAL INCIDENT
-    - Trigger lockdown log event
-    """
     host = _get_or_create(ip)
     host.threat_type = "RANSOMWARE"
     host.incident_count += 1
@@ -118,15 +162,16 @@ def _handle_ransomware(ip: str, reason: str, conf: float, simulation: bool = Fal
     print(f"  Action: FULL ISOLATION")
     print(f"{'!'*60}\n")
 
-    # Force-block regardless of progressive counter
-    # (Ransomware warrants immediate hard block — no 3-hit requirement)
     if ip not in _states:
         _states[ip] = IPState()
-    _states[ip].hit_count = 99  # Bypass progressive counter
+    _states[ip].hit_count = 99
     _states[ip].first_hit_time = time.time()
 
     block_ip(ip, reason=f"RANSOMWARE ISOLATION:{reason}")
     host.status = "ISOLATED"
+
+    # [DB] persist isolation
+    _db_action(ip, "ISOLATE", reason, block=True, new_status="ISOLATED")
 
     if simulation:
         log.warning(f"[SIMULATION] System lockdown event triggered for {ip} (no real OS changes)")
@@ -143,6 +188,9 @@ def _handle_ddos(ip: str, reason: str, conf: float):
     execute_decision(ip, "BLOCK", reason=f"DDoS:{reason}", conf=conf)
     host.status = "COMPROMISED"
 
+    # [DB] persist block
+    _db_action(ip, "BLOCK", reason, block=True, new_status="COMPROMISED")
+
 
 def _handle_bruteforce(ip: str, reason: str, conf: float):
     host = _get_or_create(ip)
@@ -153,6 +201,9 @@ def _handle_bruteforce(ip: str, reason: str, conf: float):
     log.warning(f"[BRUTEFORCE ACTION] ip={ip} | conf={conf:.2f} | {reason}")
     execute_decision(ip, "BLOCK", reason=f"BruteForce:{reason}", conf=conf)
     host.status = "COMPROMISED"
+
+    # [DB] persist block
+    _db_action(ip, "BLOCK", reason, block=True, new_status="COMPROMISED")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -191,11 +242,16 @@ def execute_action(
         host = _get_or_create(ip)
         host.status = "CLEAN"
         host.notes.append(f"[{_ts()}] Unblocked")
+        # [DB] remove from blocked_ips + update host
+        _db_action(ip, "UNBLOCK", "manually unblocked", block=False, new_status="CLEAN")
+        threading.Thread(target=remove_blocked_ip, args=(ip,), daemon=True).start()
         return
 
     if decision == "MONITOR":
         monitor_ip(ip, reason=reason)
         _get_or_create(ip).status = "MONITORED"
+        # [DB] log monitoring action
+        _db_action(ip, "MONITOR", reason, block=False, new_status="MONITORED")
         return
 
     # For BLOCK / ISOLATE — route by threat type
@@ -216,6 +272,8 @@ def execute_action(
     else:
         # Generic block through progressive engine
         execute_decision(ip, "BLOCK", reason=reason, conf=conf)
+        # [DB] persist generic block
+        _db_action(ip, "BLOCK", reason, block=True, new_status="COMPROMISED")
 
 
 # ──────────────────────────────────────────────────────────────

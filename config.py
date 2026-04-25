@@ -123,3 +123,11 @@ ATTACK_CLASS_NAMES = {
 API_HOST = "127.0.0.1"
 API_PORT = 5000
 API_URL  = f"http://{API_HOST}:{API_PORT}/predict"
+
+# ==============================
+# Auto Response
+# ==============================
+AUTO_RESPONSE_ENABLED = False
+AUTO_RESPONSE_MAX_ACTIONS_PER_IP = 3
+AUTO_RESPONSE_COOLDOWN_SEC = 600
+AUTO_RESPONSE_HIGH_PPS = 100

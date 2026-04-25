@@ -10,7 +10,7 @@ from sklearn.metrics import classification_report, confusion_matrix
 import joblib
 
 
-path = r"C:\Users\Yusse\Workspace\Graduation Project\MachineLearningCVE1.1\dataset"
+path = r"D:\CIC\Last semester 2026\Graduation Project\MachineLearning\Cyber-Attack-AI\dataset"
 
 # ==============================
 #  Preprocessing

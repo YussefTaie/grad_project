@@ -1,59 +1,113 @@
 """
-agent_live_real.py  —  Unified Live IDS Agent (Full Integration)
-================================================================
-Pipeline الكامل على حركة المرور الحية:
+agent_live_real.py  —  REAL-TIME IDS/IPS Pipeline (Full Integration)
+======================================================================
+Architecture:
 
-  Packets (Scapy)
-       ↓
-  Stateful Flow Table  (تجميع الحزم في تدفقات)
-       ↓
-  Completed Flow  (بعد FLOW_TIMEOUT ثانية من السكون)
-       ↓ ─────────────────────────────────────────
-       │  ① ML API        ← XGBoost + IsoForest
-       │  ② BruteForce    ← rule-based (rolling window)
-       │  ③ Malware       ← beaconing + exfil + asymmetry
-       │  ④ DDoS          ← PPS threshold (rolling window)
-       ↓ ─────────────────────────────────────────
-  Fusion Engine  (دمج كل الإشارات)
-       ↓
-  Action Engine  (block / monitor / allow)
+  [1] Live Traffic Sniffing    (Scapy — main thread)
+        ↓
+  [2] Stateful Flow Table      (bidirectional, per 5-tuple)
+        ↓  (on flow completion)
+  [3] Feature Extraction       (74 CICIDS-compatible features)
+        ↓  ──────────────────────────────────────────────────
+        │  THREAD A (per completed flow — non-blocking):
+        │    [4a] ML API  POST /predict
+        │          ↓  response: {result, confidence, attack_type}
+        │    [4b] FALLBACK: local rule-based if API is down
+        │          ↓
+        │    [5]  IPS Action (via ActionManager):
+        │           ATTACK     → execute_action(BLOCK)
+        │           SUSPICIOUS → execute_action(MONITOR)
+        │           NORMAL     → nothing
+        │
+        │  THREAD B (every 10s — aggregate window):
+        │    [4c] DDoS Detector        ← PPS rule
+        │    [4d] Brute Force Detector ← attempt count
+        │    [4e] Malware Detector     ← beacon + exfil + asymmetry
+        │          ↓  fusion
+        │    [5]  IPS Action (via ActionManager)
+        │
+  [6] Rate Limiter             (max 1 API call / IP / 30s)
+  [7] Duplicate Block Guard    (tracked in action.py _states)
+  [8] Structured Logging       ([API] / [IPS] / [FALLBACK] / [ERROR])
 
-Rolling Window:
-  آخر ROLLING_WINDOW_SIZE تدفق مكتمل محفوظ في الذاكرة.
-  كل ANALYSIS_INTERVAL ثانية بيتشغّل تحليل aggregate على النافذة.
+Constraints:
+  - Scapy sniff() is NEVER blocked by API calls (threading)
+  - ActionManager is the single IPS entry point (no raw take_action)
+  - Whitelist is enforced at ActionManager level (gateway, DNS, localhost)
+  - API errors are caught and logged; fallback activates automatically
 """
 
-import threading
+# ── stdlib ────────────────────────────────────────────────────────────────────
+import sys
 import time
+import logging
+import threading
+from collections import defaultdict, deque
+
+# ── third-party ───────────────────────────────────────────────────────────────
 import numpy as np
 import requests
-from collections import defaultdict, deque
 from scapy.all import sniff, IP, TCP, UDP
 
-# ── Local modules ─────────────────────────────────────────────
-from action import take_action
+# ── local modules ─────────────────────────────────────────────────────────────
 from config import (
     FLOW_TIMEOUT_SEC,
     MAX_FLOW_PACKETS,
     API_URL,
     DDOS_PPS_THRESHOLD,
     DDOS_MIN_ALERTS,
+    ATTACK_CLASS_NAMES,
 )
+from action_manager import execute_action            # ← INTEGRATION POINT
 from brute_force_detector import bruteforce_verdict_by_ip
 from malware_detector      import malware_verdict_by_ip
 from ddos_detector_module  import detect_ddos_from_flows
-# FIX 1 + FIX 5 — shared, consistent PPS calculation
 from flow_utils            import compute_pps
 
-# ══════════════════════════════════════════════════════════════
-# ⚙️  Configuration
-# ══════════════════════════════════════════════════════════════
-ROLLING_WINDOW_SIZE = 500      # أقصى عدد تدفقات محفوظة في النافذة
-ANALYSIS_INTERVAL   = 10.0     # كل كام ثانية يتشغّل الـ aggregate analysis
+# ── [DB] Sync wrappers — agent runs in threads, needs sync bridge to asyncpg ─
+from db import sync_insert_flow as insert_flow, sync_upsert_host as upsert_host
 
-# ══════════════════════════════════════════════════════════════
-# 🗂️  Stateful Flow Table
-# ══════════════════════════════════════════════════════════════
+# ── encoding ──────────────────────────────────────────────────────────────────
+sys.stdout.reconfigure(encoding="utf-8")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 0 — LOGGING SETUP
+# ══════════════════════════════════════════════════════════════════════════════
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)-8s %(name)s  %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+log = logging.getLogger("IDS-IPS")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 1 — CONFIGURATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Rolling window: last N completed flows kept in memory for aggregate analysis
+ROLLING_WINDOW_SIZE = 500
+
+# How often (seconds) to run the aggregate detectors on the rolling window
+ANALYSIS_INTERVAL   = 10.0
+
+# Rate limiter: min seconds between API calls for the same src_ip
+API_RATE_LIMIT_SEC  = 30.0
+
+# Minimum confidence to trigger IPS action from ML verdict
+MIN_CONFIDENCE_TO_ACT = 0.70
+
+# Confidence threshold above which ATTACK is immediate (no debounce)
+HIGH_CONFIDENCE_THRESHOLD = 0.85
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 2 — SHARED STATE
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Stateful flow table: flow_key → {packets, timestamps, src/dst metadata}
 flow_table: dict = defaultdict(lambda: {
     "packets":   [],
     "last_seen": 0.0,
@@ -64,15 +118,69 @@ flow_table: dict = defaultdict(lambda: {
 })
 flow_lock = threading.Lock()
 
-# Rolling window of completed flows (shared between threads)
+# Rolling window of completed feature dicts (shared across threads)
 _rolling_window: deque = deque(maxlen=ROLLING_WINDOW_SIZE)
 _window_lock = threading.Lock()
 
+# ── [6] Rate Limiter: tracks last API call time per src_ip ───────────────────
+# { src_ip → last_call_unix_timestamp }
+_api_rate_limiter: dict = {}
+_rate_limiter_lock = threading.Lock()
 
-# ══════════════════════════════════════════════════════════════
-# 🔑  Flow Key (bidirectional)
-# ══════════════════════════════════════════════════════════════
+# ── API liveness flag (toggled by health-check thread) ───────────────────────
+_api_alive = threading.Event()
+_api_alive.set()   # assume alive at start
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 3 — HELPER UTILITIES
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _map_attack_type_to_threat(attack_type: str) -> str:
+    """
+    Maps ML attack_type string → ActionManager ThreatType literal.
+    This ensures the correct threat-specific handler fires (malware,
+    ddos, bruteforce, generic).
+    """
+    t = attack_type.upper()
+
+    # ── [INTEGRATION] Threat-type mapping ───────────────────────────────────
+    if "DDOS" in t or "DOS" in t:
+        return "DDOS"
+    if "BRUTE" in t or "PATATOR" in t or "FTP" in t or "SSH" in t:
+        return "BRUTEFORCE"
+    if "RANSOMWARE" in t:
+        return "RANSOMWARE"
+    if "MALWARE" in t or "BOTNET" in t or "BOT" in t or "WEB" in t:
+        return "MALWARE"
+    if "PORT" in t or "SCAN" in t:
+        return "GENERIC"
+    return "GENERIC"
+
+
+def _can_call_api(src_ip: str) -> bool:
+    """
+    [6] Rate Limiter — returns True if it's safe to call the API for this IP.
+    Prevents flooding the API with calls for the same source IP.
+    """
+    now = time.time()
+    with _rate_limiter_lock:
+        last = _api_rate_limiter.get(src_ip, 0.0)
+        if now - last >= API_RATE_LIMIT_SEC:
+            _api_rate_limiter[src_ip] = now
+            return True
+        return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 4 — FLOW KEY + PACKET PARSING
+# ══════════════════════════════════════════════════════════════════════════════
+
 def get_flow_key(pkt):
+    """
+    Returns a canonical (bidirectional) 4-tuple key for the flow,
+    plus the source and destination IPs for this particular packet.
+    """
     if IP not in pkt:
         return None, None, None
     src = pkt[IP].src
@@ -83,15 +191,14 @@ def get_flow_key(pkt):
         sport, dport = pkt[UDP].sport, pkt[UDP].dport
     else:
         sport, dport = 0, 0
+    # Canonical ordering so A→B and B→A have the same key
     if (src, sport) < (dst, dport):
         return (src, sport, dst, dport), src, dst
     return (dst, dport, src, sport), src, dst
 
 
-# ══════════════════════════════════════════════════════════════
-# 📦  Per-Packet Data Extraction
-# ══════════════════════════════════════════════════════════════
 def parse_packet(pkt, flow_src_ip: str) -> dict:
+    """Extracts per-packet statistics for later flow feature computation."""
     size   = len(pkt)
     is_fwd = (pkt[IP].src == flow_src_ip)
     flags  = {}
@@ -105,30 +212,39 @@ def parse_packet(pkt, flow_src_ip: str) -> dict:
             "ACK": bool(t.flags & 0x10),
             "URG": bool(t.flags & 0x20),
         }
-    return {"time": float(pkt.time), "size": size,
-            "direction": "fwd" if is_fwd else "bwd", **flags}
+    return {
+        "time":      float(pkt.time),
+        "size":      size,
+        "direction": "fwd" if is_fwd else "bwd",
+        **flags,
+    }
 
 
-# ══════════════════════════════════════════════════════════════
-# 🧮  Flow Feature Computation  (CICIDS-compatible)
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 5 — FEATURE COMPUTATION  (CICIDS-compatible, 74+ features)
+# ══════════════════════════════════════════════════════════════════════════════
+
 def compute_flow_features(flow_data: dict) -> dict | None:
+    """
+    Converts raw per-packet data into a CICIDS-compatible feature vector
+    suitable for the ML API.
+    """
     pkts = flow_data["packets"]
     if not pkts:
         return None
 
-    times = [p["time"] for p in pkts]
-    sizes = [p["size"] for p in pkts]
-    fwd   = [p for p in pkts if p["direction"] == "fwd"]
-    bwd   = [p for p in pkts if p["direction"] == "bwd"]
+    times  = [p["time"] for p in pkts]
+    sizes  = [p["size"] for p in pkts]
+    fwd    = [p for p in pkts if p["direction"] == "fwd"]
+    bwd    = [p for p in pkts if p["direction"] == "bwd"]
+    fwd_sz = [p["size"] for p in fwd]
+    bwd_sz = [p["size"] for p in bwd]
 
     dur_us = (times[-1] - times[0]) * 1_000_000 if len(times) > 1 else 1.0
     if dur_us == 0:
         dur_us = 1.0
 
-    iats     = [times[i+1] - times[i] for i in range(len(times)-1)]
-    fwd_sz   = [p["size"] for p in fwd]
-    bwd_sz   = [p["size"] for p in bwd]
+    iats = [times[i + 1] - times[i] for i in range(len(times) - 1)]
 
     def safe_mean(lst): return float(np.mean(lst)) if lst else 0.0
     def safe_std(lst):  return float(np.std(lst))  if lst else 0.0
@@ -136,12 +252,12 @@ def compute_flow_features(flow_data: dict) -> dict | None:
     def safe_min(lst):  return float(min(lst))      if lst else 0.0
 
     return {
-        # identifiers (for aggregate detectors)
+        # ── [2] Feature Extraction — Identifiers ────────────────────────────
         "Src IP":   flow_data["src_ip"],
         "Dst IP":   flow_data["dst_ip"],
         "Src Port": flow_data["src_port"],
         "Dst Port": flow_data["dst_port"],
-        # CICIDS features
+        # ── CICIDS features ──────────────────────────────────────────────────
         "Destination Port":              flow_data["dst_port"],
         "Flow Duration":                 dur_us,
         "Total Fwd Packets":             len(fwd),
@@ -185,33 +301,175 @@ def compute_flow_features(flow_data: dict) -> dict | None:
         "Subflow Bwd Bytes":             sum(bwd_sz),
         "act_data_pkt_fwd":             sum(1 for p in fwd if p["size"] > 0),
         "min_seg_size_forward":          safe_min(fwd_sz),
-        # FIX 1 + FIX 5: use shared compute_pps() with 0.01s floor
-        # (was: len(pkts) / max(dur_us / 1e6, 1e-6)  → could reach 1,000,000)
-        "Packets per Second": compute_pps(len(pkts), dur_us / 1_000_000),
-        "Total Packets":      len(pkts),
-        "Total Bytes":        sum(sizes),
+        # ── DDoS / PPS helpers ───────────────────────────────────────────────
+        "Packets per Second":            compute_pps(len(pkts), dur_us / 1_000_000),
+        "Total Packets":                 len(pkts),
+        "Total Bytes":                   sum(sizes),
     }
 
 
-# ══════════════════════════════════════════════════════════════
-# 🧠  Fusion Engine  (دمج كل الإشارات)
-# ══════════════════════════════════════════════════════════════
-def fusion(
-    ml_result:      dict,
-    ddos_verdict:   str,
-    brute_verdict:  str,
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 6 — FALLBACK: LOCAL RULE-BASED DETECTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _local_fallback(features: dict) -> dict:
+    """
+    [4b] FALLBACK — used when the ML API is unreachable.
+    Applies simple heuristic rules directly on the feature vector
+    so the IPS never goes completely blind.
+
+    Rules:
+      - SYN flood  : SYN Flag Count / Total Packets > 0.9 AND PPS > 100
+      - Port scan  : many unique dst ports (heuristic via RST count)
+      - High volume: Total Bytes > 5MB in one flow
+    """
+    result     = "NORMAL"
+    attack_type = "BENIGN"
+    confidence  = 0.5   # fallback rules aren't probabilistic
+
+    total_pkts = features.get("Total Packets", 1) or 1
+    syn_count  = features.get("SYN Flag Count",  0)
+    pps        = features.get("Packets per Second", 0)
+    total_bytes = features.get("Total Bytes", 0)
+
+    syn_ratio = syn_count / total_pkts
+
+    # ── [4b] Heuristic rules ─────────────────────────────────────────────────
+    if syn_ratio > 0.90 and pps > DDOS_PPS_THRESHOLD:
+        result, attack_type, confidence = "ATTACK", "DDoS(Fallback-SYNFlood)", 0.80
+
+    elif total_bytes > 5_000_000:
+        result, attack_type, confidence = "SUSPICIOUS", "Exfiltration(Fallback)", 0.65
+
+    elif features.get("RST Flag Count", 0) / total_pkts > 0.5:
+        result, attack_type, confidence = "SUSPICIOUS", "Scan(Fallback-RST)", 0.60
+
+    return {
+        "result":      result,
+        "attack_type": attack_type,
+        "confidence":  confidence,
+        "source":      "FALLBACK",
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 7 — ML API CALL  (non-blocking, with timeout + fallback)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _call_api(features: dict) -> dict:
+    """
+    [3] Sends a POST request to the Flask ML API.
+
+    Error handling:
+      - Connection refused / timeout → fallback to local rules + marks API down
+      - Non-200 response → fallback
+      - Invalid JSON → fallback
+
+    [8] Logging:
+      [API]     → successful response
+      [FALLBACK] → API was down, used local rules
+      [ERROR]   → unexpected exception
+    """
+    try:
+        resp = requests.post(API_URL, json=features, timeout=3)
+        if resp.status_code == 200:
+            data = resp.json()
+            data["source"] = "ML_API"
+            if not _api_alive.is_set():
+                _api_alive.set()
+                log.info("[API] Connection restored.")
+            return data
+
+        # ── Non-200 response ─────────────────────────────────────────────────
+        log.warning(f"[API] Non-200 response: HTTP {resp.status_code} — using fallback")
+        return _local_fallback(features)
+
+    except requests.exceptions.ConnectionError:
+        if _api_alive.is_set():
+            _api_alive.clear()
+            log.error("[API] Connection refused — API is DOWN. Switching to FALLBACK mode.")
+        return _local_fallback(features)
+
+    except requests.exceptions.Timeout:
+        log.warning("[API] Request timed out after 3s — using fallback")
+        return _local_fallback(features)
+
+    except Exception as e:
+        # ── [8] ERROR logging ────────────────────────────────────────────────
+        log.error(f"[ERROR] Unexpected API error: {e}")
+        return _local_fallback(features)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 8 — IPS DISPATCHER  (single entry point for all actions)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _dispatch_ips(
+    src_ip:      str,
+    verdict:     str,
+    attack_type: str,
+    confidence:  float,
+    source:      str = "ML_API",
+):
+    """
+    [5] IPS Action Dispatcher — INTEGRATION POINT.
+
+    Routes the detection verdict to the ActionManager with the correct
+    threat type. This replaces the old take_action() call and ensures:
+      ✓ Whitelist checked (gateway, DNS, localhost — never blocked)
+      ✓ Threat-specific handler fires (malware, ddos, bruteforce, generic)
+      ✓ Progressive debouncing (needs N hits before hard block)
+      ✓ Deduplication (no double-blocking same IP)
+
+    [8] Logging:
+      [IPS] → action taken
+    """
+    if verdict == "NORMAL":
+        return   # Nothing to do
+
+    threat_type = _map_attack_type_to_threat(attack_type)
+    decision    = "BLOCK" if verdict == "ATTACK" else "MONITOR"
+
+    reason = (
+        f"source={source} | type={attack_type} | "
+        f"verdict={verdict} | conf={confidence:.3f}"
+    )
+
+    # ── [8] IPS log ──────────────────────────────────────────────────────────
+    icon = "[!!]" if verdict == "ATTACK" else "[? ]"
+    log.warning(
+        f"[IPS] {icon} {decision:<7}  src={src_ip:<16}  "
+        f"threat={threat_type:<12}  type={attack_type:<22}  conf={confidence:.3f}"
+    )
+
+    # ── [INTEGRATION] Call ActionManager ─────────────────────────────────────
+    execute_action(
+        ip          = src_ip,
+        threat_type = threat_type,  # type: ignore[arg-type]
+        decision    = decision,     # type: ignore[arg-type]
+        reason      = reason,
+        conf        = confidence,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 9 — FUSION ENGINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _fusion(
+    ml_result:       dict,
+    ddos_verdict:    str,
+    brute_verdict:   str,
     malware_verdict: str,
 ) -> tuple[str, str]:
     """
-    يدمج كل الإشارات ويرجع (final_verdict, reason).
-    الأولوية: DDoS > BruteForce > Malware > ML
+    Combines all detection signals into (final_verdict, reason).
+    Priority: DDoS > BruteForce > Malware > ML
     """
     if ddos_verdict == "ATTACK":
         return "ATTACK", "DDoS"
-
     if brute_verdict == "ATTACK":
         return "ATTACK", "BruteForce"
-
     if malware_verdict == "ATTACK":
         return "ATTACK", "Malware"
 
@@ -220,113 +478,138 @@ def fusion(
 
     if "ATTACK" in ml_label:
         return "ATTACK", f"ML:{ml_type}"
-
     if malware_verdict == "SUSPICIOUS" or "SUSPICIOUS" in ml_label:
-        return "SUSPICIOUS", f"ML:{ml_type}" if "SUSPICIOUS" in ml_label else "Malware(Suspicious)"
-
+        return (
+            "SUSPICIOUS",
+            f"ML:{ml_type}" if "SUSPICIOUS" in ml_label else "Malware(Suspicious)",
+        )
     return "NORMAL", "BENIGN"
 
 
-# ══════════════════════════════════════════════════════════════
-# 📡  Single-Flow Processing  (ML API + per-flow action)
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 10 — THREAD A: PER-FLOW PROCESSING (ML API → IPS)
+# ══════════════════════════════════════════════════════════════════════════════
+
 def process_completed_flow(flow_key, flow_data: dict):
     """
-    يُشغَّل لكل تدفق مكتمل:
-      1. يحسب الـ feature vector
-      2. يبعته للـ ML API
-      3. يضيفه للـ rolling window
-      4. يحفظ الـ ML verdict للـ fusion في الـ aggregate thread
+    [THREAD A] Runs for every completed flow in a daemon thread.
+    Non-blocking: Scapy sniff() is never stalled by this function.
+
+    Steps:
+      1. Compute 74-feature vector                  [2]
+      2. Rate-limit check                           [6]
+      3. POST to ML API (with fallback)             [3][4b]
+      4. Log the API response                       [8]
+      5. Dispatch IPS action if needed              [5]
+      6. Add features to rolling window             (aggregate)
     """
+    # ── [2] Feature extraction ───────────────────────────────────────────────
     features = compute_flow_features(flow_data)
     if not features:
         return
 
     src_ip = flow_data["src_ip"]
 
-    # ── إضافة للـ rolling window ──────────────────────────────
+    # ── [DB] Persist flow + host (daemon sub-thread, fire-and-forget) ────────
+    def _store_flow():
+        try:
+            upsert_host(src_ip)           # ensure hosts row exists
+            insert_flow(
+                src_ip   = src_ip,
+                dst_ip   = flow_data.get("dst_ip", "unknown"),
+                packets  = features.get("Total Packets", 0),
+                bytes_   = features.get("Total Bytes",   0),
+                pps      = features.get("Packets per Second", 0.0),
+                duration = features.get("Flow Duration", 0.0),
+            )
+        except Exception as _e:
+            log.error(f"[DB ERROR] store_flow failed for {src_ip}: {_e}")
+
+    threading.Thread(target=_store_flow, daemon=True).start()
+    # ─────────────────────────────────────────────────────────────────────
+
+    # ── [6] Rate limiting — skip API if called too recently ──────────────────
+    if not _can_call_api(src_ip):
+        return
+
+    # ── Add to rolling window ─────────────────────────────────────────────────
     with _window_lock:
         _rolling_window.append(features)
 
-    # ── ML API ────────────────────────────────────────────────
-    try:
-        resp = requests.post(API_URL, json=features, timeout=3)
-        if resp.status_code != 200:
-            return
-        ml_result = resp.json()
-    except Exception:
-        return
+    # ── [3] Call ML API (blocking call — runs in daemon thread, safe) ─────────
+    ml_result = _call_api(features)
 
-    # ── Verdict من الـ ML فقط (aggregate يكمّل الباقي) ────────
-    ml_label    = ml_result.get("result", "NORMAL")
-    attack_type = ml_result.get("attack_type", "")
-    confidence  = ml_result.get("confidence", 0.0)
+    verdict    = ml_result.get("result",      "NORMAL")
+    attack_type = ml_result.get("attack_type", "BENIGN")
+    confidence  = ml_result.get("confidence",  0.0)
+    source      = ml_result.get("source",      "ML_API")
 
-    icon = "[OK]"
-    if "ATTACK" in ml_label.upper():
-        icon = "[!!]"
-    elif "SUSPICIOUS" in ml_label.upper():
-        icon = "[? ]"
-
-    print(
-        f"  {icon} ML  src={src_ip:<15}  "
-        f"type={attack_type:<22}  conf={confidence:.3f}"
+    # ── [8] API response log ─────────────────────────────────────────────────
+    src_tag  = source[:2]   # "ML" or "FA" (FALLBACK)
+    icon     = "[!!]" if "ATTACK" in verdict.upper() \
+               else "[? ]" if "SUSPICIOUS" in verdict.upper() \
+               else "[OK]"
+    log.info(
+        f"[{src_tag}]  {icon} src={src_ip:<16}  "
+        f"verdict={verdict:<10}  type={attack_type:<22}  conf={confidence:.3f}"
     )
 
-    # اتخذ إجراء فوري لو ML قالت ATTACK بثقة عالية
-    if "ATTACK" in ml_label.upper() and confidence > 0.85:
-        take_action(ml_label, src_ip, attack_type=attack_type)
+    # ── [5] IPS action — only if confidence meets threshold ──────────────────
+    if "NORMAL" not in verdict.upper() and confidence >= MIN_CONFIDENCE_TO_ACT:
+        _dispatch_ips(src_ip, verdict, attack_type, confidence, source)
 
 
-# ══════════════════════════════════════════════════════════════
-# 🔁  Aggregate Analysis Thread  (كل ANALYSIS_INTERVAL ثانية)
-# ══════════════════════════════════════════════════════════════
-def aggregate_analysis_loop():
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 11 — THREAD B: AGGREGATE ANALYSIS (DDoS / BruteForce / Malware)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _aggregate_analysis_loop():
     """
-    Thread يشتغل كل ANALYSIS_INTERVAL ثانية ويحلل الـ rolling window
-    باستخدام:
-      - brute_force_detector
-      - malware_detector
-      - ddos_detector_module
-    ثم يتخذ إجراء على كل IP مشبوه.
+    [THREAD B] Runs every ANALYSIS_INTERVAL seconds.
+    Analyzes the rolling window of completed flows with rule-based detectors
+    that require multiple flows (DDoS, BruteForce, Malware beaconing).
+
+    Results are fused and dispatched to the IPS via ActionManager.
     """
     while True:
         time.sleep(ANALYSIS_INTERVAL)
 
+        # Snapshot the rolling window (lock-protected copy)
         with _window_lock:
             window = list(_rolling_window)
 
         if not window:
             continue
 
-        print(f"\n{'='*60}")
-        print(f"  [~] Aggregate Analysis  ({len(window)} flows in window)")
-        print(f"{'='*60}")
+        print(f"\n{'='*68}")
+        print(f"  [~] Aggregate Analysis — {len(window)} flows in window")
+        print(f"{'='*68}")
 
-        # ── DDoS ─────────────────────────────────────────────
-        ddos_verdicts   = detect_ddos_from_flows(window)
+        # ── [4c] DDoS ────────────────────────────────────────────────────────
+        ddos_verdicts    = detect_ddos_from_flows(window)
 
-        # ── Brute Force ───────────────────────────────────────
-        brute_verdicts  = bruteforce_verdict_by_ip(window)
+        # ── [4d] Brute Force ─────────────────────────────────────────────────
+        brute_verdicts   = bruteforce_verdict_by_ip(window)
 
-        # ── Malware ───────────────────────────────────────────
+        # ── [4e] Malware ──────────────────────────────────────────────────────
         malware_verdicts = malware_verdict_by_ip(window)
 
-        # ── Collect all IPs seen in this window ───────────────
-        all_ips = set()
-        for f in window:
-            ip = f.get("Src IP") or f.get("Source IP", "unknown")
-            all_ips.add(ip)
+        # ── Collect unique src IPs from window ────────────────────────────────
+        all_ips = {
+            f.get("Src IP") or f.get("Source IP", "unknown")
+            for f in window
+        }
 
-        acted = set()
+        acted_ips: list[str] = []
+
         for ip in all_ips:
-            ddos_v   = ddos_verdicts.get(ip,    "NORMAL")
-            brute_v  = brute_verdicts.get(ip,   "NORMAL")
+            ddos_v    = ddos_verdicts.get(ip,    "NORMAL")
+            brute_v   = brute_verdicts.get(ip,   "NORMAL")
             malware_v = malware_verdicts.get(ip, "NORMAL")
 
-            # Fuse rule-based only (ML already acted per-flow)
-            dummy_ml = {"result": "NORMAL", "confidence": 0.0}
-            final, reason = fusion(dummy_ml, ddos_v, brute_v, malware_v)
+            # ML signal is empty here (handled per-flow in THREAD A)
+            dummy_ml  = {"result": "NORMAL", "confidence": 0.0}
+            final, reason = _fusion(dummy_ml, ddos_v, brute_v, malware_v)
 
             if final in ("ATTACK", "SUSPICIOUS"):
                 flags = []
@@ -336,48 +619,90 @@ def aggregate_analysis_loop():
                     flags.append(f"Malware({malware_v})")
                 flags_str = "+".join(flags) or reason
 
-                icon = "[!!]" if final == "ATTACK" else "[? ]"
-                print(
-                    f"  {icon} [{final:<10}]  src={ip:<16}  "
-                    f"detectors={flags_str}"
+                # ── [5] IPS dispatch ──────────────────────────────────────────
+                _dispatch_ips(
+                    src_ip      = ip,
+                    verdict     = final,
+                    attack_type = flags_str,
+                    confidence  = 0.90 if final == "ATTACK" else 0.70,
+                    source      = "AGGREGATE",
                 )
-                take_action(final, ip, attack_type=flags_str)
-                acted.add(ip)
+                acted_ips.append(ip)
 
-        if not acted:
-            print("  [OK] No aggregate threats detected in this window.")
+        if not acted_ips:
+            log.info("  [OK] No aggregate threats detected this window.")
         print()
 
 
-# ══════════════════════════════════════════════════════════════
-# ⏰  Flow Timeout Flusher  (يُرسل التدفقات المنتهية)
-# ══════════════════════════════════════════════════════════════
-def flow_timeout_flusher():
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 12 — FLOW TIMEOUT FLUSHER THREAD
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _flow_timeout_flusher():
+    """
+    Flushes flows that have been idle for FLOW_TIMEOUT_SEC seconds.
+    Runs every second in a daemon thread.
+    """
     while True:
         time.sleep(1.0)
-        now = time.time()
+        now     = time.time()
         expired = []
 
         with flow_lock:
-            for key, flow in flow_table.items():
+            for key, flow in list(flow_table.items()):
                 if flow["last_seen"] > 0 and (now - flow["last_seen"]) >= FLOW_TIMEOUT_SEC:
                     expired.append((key, dict(flow)))
 
         for key, snapshot in expired:
-            process_completed_flow(key, snapshot)
+            # Remove from table first to avoid races
             with flow_lock:
                 flow_table.pop(key, None)
+            # Process in a new daemon thread — keeps sniff() unblocked
+            threading.Thread(
+                target=process_completed_flow,
+                args=(key, snapshot),
+                daemon=True,
+            ).start()
 
 
-# ══════════════════════════════════════════════════════════════
-# 📥  Packet Handler
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 13 — API HEALTH MONITOR  (optional background check)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _api_health_monitor():
+    """
+    Periodically checks if the API is back online after a failure.
+    Updates _api_alive event so logs reflect current state.
+    """
+    health_url = API_URL.replace("/predict", "/health")
+    while True:
+        time.sleep(15)
+        if not _api_alive.is_set():
+            try:
+                r = requests.get(health_url, timeout=2)
+                if r.status_code == 200:
+                    _api_alive.set()
+                    log.info("[API] Health check: API is back ONLINE.")
+            except Exception:
+                pass   # Still down — try again next cycle
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 14 — PACKET HANDLER  (Scapy main thread)
+# ══════════════════════════════════════════════════════════════════════════════
+
 def on_packet(pkt):
+    """
+    Called by Scapy for every captured packet.
+    Only populates the stateful flow table — never blocks on API.
+    When a flow is full (MAX_FLOW_PACKETS), it's flushed to a daemon thread.
+    """
     key, src_ip, dst_ip = get_flow_key(pkt)
     if key is None:
         return
 
-    pkt_data = parse_packet(pkt, src_ip)
+    pkt_data   = parse_packet(pkt, src_ip)
+    flush_snap = None   # set if flow is full mid-packet
 
     with flow_lock:
         flow = flow_table[key]
@@ -390,47 +715,70 @@ def on_packet(pkt):
         flow["packets"].append(pkt_data)
         flow["last_seen"] = pkt_data["time"]
 
+        # ── [5 OPTIMIZATION] Batch: flush when MAX_FLOW_PACKETS reached ──────
         if len(flow["packets"]) >= MAX_FLOW_PACKETS:
-            snapshot = dict(flow)
-            flow_table.pop(key, None)
+            flush_snap = dict(flow)
+            del flow_table[key]
 
-    if len(flow_table.get(key, {}).get("packets", [])) == 0:
-        # تم المسح داخل الـ lock → شغّل في thread منفصل
+    if flush_snap:
         threading.Thread(
             target=process_completed_flow,
-            args=(key, snapshot),
+            args=(key, flush_snap),
             daemon=True,
         ).start()
 
 
-# ══════════════════════════════════════════════════════════════
-# 🚀  Entry Point
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 15 — ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
+
 if __name__ == "__main__":
-    print("=" * 60)
-    print("  [*] Unified Live IDS Agent — Full Integration")
-    print(f"  Flow Timeout    : {FLOW_TIMEOUT_SEC}s")
-    print(f"  Max Pkts/Flow   : {MAX_FLOW_PACKETS}")
-    print(f"  Analysis Window : {ROLLING_WINDOW_SIZE} flows")
-    print(f"  Analysis Every  : {ANALYSIS_INTERVAL}s")
-    print(f"  ML API          : {API_URL}")
-    print("=" * 60)
     print()
-    print("  Active Detectors:")
-    print("    [1] ML (XGBoost + IsoForest)  <- per completed flow")
-    print("    [2] DDoS (PPS rule)           <- every 10s on window")
-    print("    [3] Brute Force (attempts)    <- every 10s on window")
-    print("    [4] Malware (beacon+exfil)    <- every 10s on window")
+    print("=" * 68)
+    print("  REAL-TIME IDS/IPS PIPELINE  —  Full Integration")
+    print("=" * 68)
+    print(f"  ML API             : {API_URL}")
+    print(f"  Flow Timeout       : {FLOW_TIMEOUT_SEC}s")
+    print(f"  Max Pkts/Flow      : {MAX_FLOW_PACKETS}")
+    print(f"  Rolling Window     : {ROLLING_WINDOW_SIZE} flows")
+    print(f"  Aggregate Interval : {ANALYSIS_INTERVAL}s")
+    print(f"  API Rate Limit     : {API_RATE_LIMIT_SEC}s / IP")
+    print(f"  Min Confidence     : {MIN_CONFIDENCE_TO_ACT}")
+    print("=" * 68)
+    print()
+    print("  IDS Detectors:")
+    print("    [1] ML  — XGBoost (6-class) + IsoForest   per flow")
+    print("    [2] DDoS  — PPS rule-based                 every 10s")
+    print("    [3] BruteForce  — attempt count            every 10s")
+    print("    [4] Malware  — beacon + exfil + asymmetry  every 10s")
+    print("    [FALLBACK] Local rules if API is down")
+    print()
+    print("  IPS Actions (via ActionManager):")
+    print("    ATTACK      → BLOCK  (threat-specific handler)")
+    print("    SUSPICIOUS  → MONITOR (log + track)")
+    print("    NORMAL      → allow (no action)")
+    print("=" * 68)
     print()
 
-    # Thread 1 — flush expired flows
-    t1 = threading.Thread(target=flow_timeout_flusher, daemon=True)
-    t1.start()
+    # ── [6] Thread: flush idle flows ─────────────────────────────────────────
+    t_flush = threading.Thread(target=_flow_timeout_flusher, daemon=True)
+    t_flush.start()
+    log.info("Thread [flow-flusher] started.")
 
-    # Thread 2 — aggregate analysis (BruteForce + Malware + DDoS)
-    t2 = threading.Thread(target=aggregate_analysis_loop, daemon=True)
-    t2.start()
+    # ── [THREAD B] Aggregate analysis ────────────────────────────────────────
+    t_agg = threading.Thread(target=_aggregate_analysis_loop, daemon=True)
+    t_agg.start()
+    log.info("Thread [aggregate-analysis] started.")
 
-    # Main thread — packet capture
-    print("[*] Sniffing on all interfaces... (Ctrl+C to stop)\n")
-    sniff(filter="ip", prn=on_packet, store=False)
+    # ── API health monitor ───────────────────────────────────────────────────
+    t_health = threading.Thread(target=_api_health_monitor, daemon=True)
+    t_health.start()
+    log.info("Thread [api-health-monitor] started.")
+
+    # ── [1] Main thread: packet capture ──────────────────────────────────────
+    log.info("Sniffing on all interfaces... (Ctrl+C to stop)\n")
+    try:
+        sniff(filter="ip", prn=on_packet, store=False)
+    except KeyboardInterrupt:
+        print("\n[*] Stopping IDS/IPS agent...")
+        log.info("Agent stopped by user.")

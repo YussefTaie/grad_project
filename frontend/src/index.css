@@ -1,0 +1,42 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+  font-family: "Segoe UI Variable", "Trebuchet MS", "Segoe UI", sans-serif;
+  background-color: #0b0f14;
+}
+
+html {
+  background:
+    radial-gradient(circle at top left, rgba(56, 189, 248, 0.1), transparent 28%),
+    radial-gradient(circle at top right, rgba(239, 68, 68, 0.12), transparent 22%),
+    #0b0f14;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background-color: transparent;
+  color: #e5eef8;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(71, 85, 105, 0.8);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(15, 23, 42, 0.45);
+}

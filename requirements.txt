@@ -1,0 +1,42 @@
+# ─────────────────────────────────────────────
+#  Cyber-Attack-AI — Python Dependencies
+#  Python 3.11 recommended (3.14 may have issues
+#  with some packages like keras/tensorflow)
+# ─────────────────────────────────────────────
+
+# Web Framework (API layer)
+fastapi
+uvicorn[standard]
+flask
+flask-cors
+
+# Async Database
+asyncpg
+sqlalchemy
+psycopg2-binary
+
+# Machine Learning
+scikit-learn
+xgboost
+numpy
+pandas
+joblib
+
+# Deep Learning (Autoencoder)
+tensorflow
+keras
+
+# Network Capture
+scapy
+
+# HTTP Requests
+requests
+httpx
+websockets
+
+# Environment Variables
+python-dotenv
+
+# Utilities
+pydantic
+starlette
